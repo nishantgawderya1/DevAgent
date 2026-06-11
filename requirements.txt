@@ -7,8 +7,9 @@ tree-sitter-javascript>=0.25
 # Embeddings: local sentence-transformers model (all-MiniLM-L6-v2, 384-dim, no API key)
 sentence-transformers>=2.2
 
-# Vector store
+# Vector store + keyword search
 qdrant-client>=1.7
+rank-bm25>=0.2.2
 
 # Config
 python-dotenv>=1.0

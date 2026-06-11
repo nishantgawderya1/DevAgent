@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -9,10 +11,10 @@ from typing import Any, Iterator, Sequence
 from app.retrieval import chunker
 
 
-INDEX_ROOT = Path("/tmp/devagent")
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+INDEX_ROOT = Path(os.getenv("DEVAGENT_INDEX_ROOT", Path(tempfile.gettempdir()) / "devagent"))
+EMBEDDING_MODEL_NAME = "text-embedding-3-small"
 BATCH_SIZE = 100
-VECTOR_SIZE = 384
+VECTOR_SIZE = 1536
 SKIP_DIRS = {"node_modules", ".venv", "__pycache__", "dist", "build", ".git"}
 
 _embedding_model: Any | None = None
@@ -80,7 +82,7 @@ def _ensure_repo_checkout(repo_full_name: str) -> Path:
 
     repo_path.parent.mkdir(parents=True, exist_ok=True)
     if repo_path.exists():
-        subprocess.run(["rm", "-rf", str(repo_path)], check=True)
+        shutil.rmtree(repo_path)
     subprocess.run(["git", "clone", f"https://github.com/{repo_full_name}.git", str(repo_path)], check=True)
     return repo_path
 
@@ -142,12 +144,24 @@ def _create_collection_if_needed(qdrant_client: Any, collection_name: str) -> No
     )
 
 
+class _OpenAIEmbedder:
+    """Thin wrapper around the OpenAI embeddings endpoint with an ``encode`` method."""
+
+    def __init__(self, client: Any, model_name: str) -> None:
+        self._client = client
+        self._model_name = model_name
+
+    def encode(self, texts: Sequence[str]) -> list[list[float]]:
+        response = self._client.embeddings.create(model=self._model_name, input=list(texts))
+        return [list(item.embedding) for item in response.data]
+
+
 def _load_embedding_model() -> Any:
     global _embedding_model
     if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
+        from openai import OpenAI
 
-        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        _embedding_model = _OpenAIEmbedder(OpenAI(), EMBEDDING_MODEL_NAME)
     return _embedding_model
 
 
@@ -158,15 +172,8 @@ def _embed_chunks(chunks: Sequence[dict[str, Any]]) -> list[list[float]]:
     model = _load_embedding_model()
     embeddings: list[list[float]] = []
     for batch in _batched([chunk["text"] for chunk in chunks], BATCH_SIZE):
-        batch_embeddings = model.encode(batch, batch_size=BATCH_SIZE, convert_to_numpy=True, show_progress_bar=False)
-        embeddings.extend(_normalize_embeddings(batch_embeddings))
+        embeddings.extend(model.encode(batch))
     return embeddings
-
-
-def _normalize_embeddings(batch_embeddings: Any) -> list[list[float]]:
-    if hasattr(batch_embeddings, "tolist"):
-        return [list(vector) for vector in batch_embeddings.tolist()]
-    return [list(vector) for vector in batch_embeddings]
 
 
 def _upsert_chunks(

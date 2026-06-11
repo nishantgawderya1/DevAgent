@@ -45,3 +45,51 @@ VALUE = 1
     assert len(chunks) == 1
     assert chunks[0]["metadata"]["node_type"] == "file"
     assert chunks[0]["text"] == source
+
+
+def test_chunk_file_records_callees(tmp_path: Path) -> None:
+    source = """import os
+
+
+def caller():
+    helper()
+    os.path.join("a", "b")
+    return None
+"""
+    file_path = tmp_path / "calls.py"
+    file_path.write_text(source, encoding="utf-8")
+
+    chunks = chunk_file(file_path)
+
+    calls = chunks[0]["metadata"]["calls"]
+    assert "helper" in calls
+    assert "join" in calls
+
+
+def test_chunk_file_handles_javascript(tmp_path: Path) -> None:
+    source = """import { readFile } from 'fs';
+
+function load(path) {
+  return readFile(path);
+}
+
+class Service {
+  start() {
+    return load('x');
+  }
+}
+
+const handler = (req) => process(req);
+"""
+    file_path = tmp_path / "app.js"
+    file_path.write_text(source, encoding="utf-8")
+
+    chunks = chunk_file(file_path)
+
+    types = {chunk["metadata"]["name"]: chunk["metadata"]["node_type"] for chunk in chunks}
+    assert [chunk["metadata"]["name"] for chunk in chunks] == ["load", "Service", "handler"]
+    assert types["load"] == "function"
+    assert types["Service"] == "class"
+    assert types["handler"] == "function"
+    assert "readFile" in chunks[0]["metadata"]["calls"]
+    assert "process" in chunks[2]["metadata"]["calls"]

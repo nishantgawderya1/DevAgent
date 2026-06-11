@@ -10,7 +10,7 @@ class FakeEmbeddingModel:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
 
-    def encode(self, texts, batch_size=100, convert_to_numpy=True, show_progress_bar=False):
+    def encode(self, texts):
         batch = list(texts)
         self.calls.append(batch)
         return [[float(len(batch))] * indexer.VECTOR_SIZE for _ in batch]

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from ast import AST, AsyncFunctionDef, ClassDef, FunctionDef, Import, ImportFrom, Module, parse
 from pathlib import Path
 from typing import TypedDict
+
+import tree_sitter_javascript as ts_javascript
+import tree_sitter_python as ts_python
+from tree_sitter import Language, Parser
 
 
 class ChunkMetadata(TypedDict):
@@ -12,6 +15,7 @@ class ChunkMetadata(TypedDict):
     start_line: int
     end_line: int
     imports: list[str]
+    calls: list[str]
 
 
 class CodeChunk(TypedDict):
@@ -20,57 +24,148 @@ class CodeChunk(TypedDict):
     metadata: ChunkMetadata
 
 
+_PY_LANGUAGE = Language(ts_python.language())
+_JS_LANGUAGE = Language(ts_javascript.language())
+
+_LANGUAGES = {".py": _PY_LANGUAGE, ".js": _JS_LANGUAGE}
+
+# Node types that wrap a definition we want to expose as a standalone chunk.
+_IMPORT_TYPES = {
+    ".py": {"import_statement", "import_from_statement"},
+    ".js": {"import_statement"},
+}
+
+# The call-expression node type per grammar; both expose the callee on the
+# "function" field.
+_CALL_TYPES = {".py": "call", ".js": "call_expression"}
+
+
 def chunk_file(file_path: str | Path) -> list[CodeChunk]:
     path = Path(file_path)
     source = path.read_text(encoding="utf-8")
+    suffix = path.suffix
 
-    if path.suffix == ".py":
-        return _chunk_python_file(path, source)
+    if suffix in _LANGUAGES:
+        chunks = _chunk_with_tree_sitter(path, source, suffix)
+        if chunks:
+            return chunks
 
-    return _chunk_file_level(path, source)
+    return [_build_file_chunk(path, source)]
 
 
-def _chunk_python_file(path: Path, source: str) -> list[CodeChunk]:
-    module = parse(source)
-    lines = source.splitlines()
-    imports = _collect_imports(module)
+def _chunk_with_tree_sitter(path: Path, source: str, suffix: str) -> list[CodeChunk]:
+    source_bytes = source.encode("utf-8")
+    parser = Parser(_LANGUAGES[suffix])
+    root = parser.parse(source_bytes).root_node
+
+    imports = _collect_imports(root, source_bytes, suffix)
     chunks: list[CodeChunk] = []
 
-    for node in module.body:
-        if isinstance(node, (FunctionDef, AsyncFunctionDef, ClassDef)):
-            chunks.extend(_chunk_python_node(path, lines, node, imports))
-
-    if chunks:
-        return chunks
-
-    return [_build_chunk(path, path.name, "file", 1, len(lines) or 1, source, imports)]
-
-
-def _chunk_python_node(path: Path, lines: list[str], node: AST, imports: list[str]) -> list[CodeChunk]:
-    if isinstance(node, (FunctionDef, AsyncFunctionDef)):
-        return [_build_function_chunk(path, lines, node, imports)]
-
-    if isinstance(node, ClassDef):
-        return [
+    for top_node in root.named_children:
+        core = _core_definition(top_node, suffix)
+        if core is None:
+            continue
+        name = _definition_name(core, source_bytes)
+        if name is None:
+            continue
+        node_type = "class" if "class" in core.type else "function"
+        chunks.append(
             _build_chunk(
                 path,
-                node.name,
-                "class",
-                node.lineno,
-                _node_end_line(node),
-                _slice_source(lines, node.lineno, _node_end_line(node)),
+                name,
+                node_type,
+                top_node.start_point[0] + 1,
+                top_node.end_point[0] + 1,
+                _node_text(top_node, source_bytes),
                 imports,
+                _collect_calls(top_node, source_bytes, suffix),
             )
-        ]
+        )
 
-    return []
+    return chunks
 
 
-def _build_function_chunk(path: Path, lines: list[str], node: FunctionDef | AsyncFunctionDef, imports: list[str]) -> CodeChunk:
-    start_line = node.lineno
-    end_line = _node_end_line(node)
-    text = _slice_source(lines, start_line, end_line)
-    return _build_chunk(path, node.name, "function", start_line, end_line, text, imports)
+def _core_definition(node, suffix: str):
+    """Return the underlying function/class node for a top-level statement, or None."""
+    node_type = node.type
+
+    if suffix == ".py":
+        if node_type in {"function_definition", "class_definition"}:
+            return node
+        if node_type == "decorated_definition":
+            return _first_child_of_types(node, {"function_definition", "class_definition"})
+        return None
+
+    # JavaScript
+    if node_type in {"function_declaration", "generator_function_declaration", "class_declaration"}:
+        return node
+    if node_type == "export_statement":
+        for child in node.named_children:
+            inner = _core_definition(child, suffix)
+            if inner is not None:
+                return inner
+        return None
+    if node_type in {"lexical_declaration", "variable_declaration"}:
+        # const handler = (req) => ... / var fn = function () { ... }
+        declarator = _first_child_of_types(node, {"variable_declarator"})
+        if declarator is not None:
+            value = declarator.child_by_field_name("value")
+            if value is not None and value.type in {"arrow_function", "function", "function_expression"}:
+                return node
+        return None
+    return None
+
+
+def _definition_name(core, source_bytes: bytes) -> str | None:
+    if core.type in {"lexical_declaration", "variable_declaration"}:
+        declarator = _first_child_of_types(core, {"variable_declarator"})
+        if declarator is None:
+            return None
+        name_node = declarator.child_by_field_name("name")
+        return _node_text(name_node, source_bytes) if name_node is not None else None
+
+    name_node = core.child_by_field_name("name")
+    return _node_text(name_node, source_bytes) if name_node is not None else None
+
+
+def _collect_imports(root, source_bytes: bytes, suffix: str) -> list[str]:
+    import_types = _IMPORT_TYPES[suffix]
+    return [
+        _node_text(node, source_bytes).strip()
+        for node in root.named_children
+        if node.type in import_types
+    ]
+
+
+def _collect_calls(node, source_bytes: bytes, suffix: str) -> list[str]:
+    call_type = _CALL_TYPES[suffix]
+    calls: list[str] = []
+    seen: set[str] = set()
+    stack = [node]
+
+    while stack:
+        current = stack.pop()
+        if current.type == call_type:
+            callee = current.child_by_field_name("function")
+            name = _callee_name(callee, source_bytes) if callee is not None else None
+            if name is not None and name not in seen:
+                seen.add(name)
+                calls.append(name)
+        stack.extend(current.named_children)
+
+    return sorted(calls)
+
+
+def _callee_name(node, source_bytes: bytes) -> str | None:
+    if node.type == "identifier":
+        return _node_text(node, source_bytes)
+    if node.type == "attribute":  # Python: pkg.mod.func -> func
+        attribute = node.child_by_field_name("attribute")
+        return _node_text(attribute, source_bytes) if attribute is not None else None
+    if node.type == "member_expression":  # JavaScript: obj.method -> method
+        prop = node.child_by_field_name("property")
+        return _node_text(prop, source_bytes) if prop is not None else None
+    return None
 
 
 def _build_chunk(
@@ -81,6 +176,7 @@ def _build_chunk(
     end_line: int,
     text: str,
     imports: list[str],
+    calls: list[str],
 ) -> CodeChunk:
     return {
         "id": f"{path.as_posix()}::{name}",
@@ -92,39 +188,23 @@ def _build_chunk(
             "start_line": start_line,
             "end_line": end_line,
             "imports": imports,
+            "calls": calls,
         },
     }
 
 
-def _chunk_file_level(path: Path, source: str) -> list[CodeChunk]:
+def _build_file_chunk(path: Path, source: str) -> CodeChunk:
     lines = source.splitlines()
-    imports = _extract_import_lines(lines)
-    return [_build_chunk(path, path.name, "file", 1, len(lines) or 1, source, imports)]
+    imports = [line.strip() for line in lines if line.lstrip().startswith(("import ", "from "))]
+    return _build_chunk(path, path.name, "file", 1, len(lines) or 1, source, imports, [])
 
 
-def _collect_imports(module: Module) -> list[str]:
-    imports: list[str] = []
-    for node in module.body:
-        if isinstance(node, Import):
-            for alias in node.names:
-                imports.append(alias.name)
-        elif isinstance(node, ImportFrom):
-            module_name = node.module or ""
-            for alias in node.names:
-                imports.append(f"{module_name}:{alias.name}" if module_name else alias.name)
-    return imports
+def _first_child_of_types(node, types: set[str]):
+    for child in node.named_children:
+        if child.type in types:
+            return child
+    return None
 
 
-def _extract_import_lines(lines: list[str]) -> list[str]:
-    return [line.strip() for line in lines if line.lstrip().startswith(("import ", "from "))]
-
-
-def _node_end_line(node: AST) -> int:
-    end_line = getattr(node, "end_lineno", None)
-    if end_line is None:
-        return getattr(node, "lineno", 1)
-    return end_line
-
-
-def _slice_source(lines: list[str], start_line: int, end_line: int) -> str:
-    return "\n".join(lines[start_line - 1 : end_line])
+def _node_text(node, source_bytes: bytes) -> str:
+    return source_bytes[node.start_byte : node.end_byte].decode("utf-8")

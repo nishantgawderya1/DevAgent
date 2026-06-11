@@ -1,0 +1,9 @@
+# Retrieval layer (implemented)
+tree-sitter>=0.22,<0.24
+tree-sitter-python>=0.21
+tree-sitter-javascript>=0.21
+openai>=1.0
+qdrant-client>=1.7
+
+# Tests
+pytest>=8.0

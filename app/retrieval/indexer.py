@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -11,11 +13,18 @@ from typing import Any, Iterator, Sequence
 from app.retrieval import chunker
 
 
+logger = logging.getLogger(__name__)
+
 INDEX_ROOT = Path(os.getenv("DEVAGENT_INDEX_ROOT", Path(tempfile.gettempdir()) / "devagent"))
-EMBEDDING_MODEL_NAME = "text-embedding-3-small"
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 BATCH_SIZE = 100
-VECTOR_SIZE = 1536
+VECTOR_SIZE = 384
 SKIP_DIRS = {"node_modules", ".venv", "__pycache__", "dist", "build", ".git"}
+
+# Qdrant only accepts unsigned-int or UUID point ids. Chunk ids are strings
+# ("path::name"), so we map them to deterministic UUIDs: the same chunk id
+# always yields the same point id, which keeps upserts idempotent.
+_POINT_ID_NAMESPACE = uuid.UUID("6f9619ff-8b86-d011-b42d-00cf4fc964ff")
 
 _embedding_model: Any | None = None
 
@@ -53,25 +62,44 @@ except Exception:  # pragma: no cover - dependency is mocked in tests
 
 
 def index_repo(repo_full_name: str) -> IndexSummary:
-    repo_path = _ensure_repo_checkout(repo_full_name)
+    """Clone, chunk, embed and upsert a repository into Qdrant.
+
+    Errors are caught and logged; on failure a zeroed summary is returned rather
+    than propagating an exception to the caller.
+    """
     collection_name = _collection_name(repo_full_name)
-    qdrant_client = _get_qdrant_client()
+    try:
+        repo_path = _ensure_repo_checkout(repo_full_name)
+        qdrant_client = _get_qdrant_client()
 
-    if _collection_has_points(qdrant_client, collection_name):
-        return IndexSummary(repo_full_name, collection_name, repo_path, 0, 0)
+        if _collection_has_points(qdrant_client, collection_name):
+            logger.info("Collection %s already populated; skipping re-index.", collection_name)
+            return IndexSummary(repo_full_name, collection_name, repo_path, 0, 0)
 
-    _create_collection_if_needed(qdrant_client, collection_name)
+        _create_collection_if_needed(qdrant_client, collection_name)
 
-    files_indexed = 0
-    chunks: list[dict[str, Any]] = []
-    for file_path in _iter_source_files(repo_path):
-        files_indexed += 1
-        chunks.extend(chunker.chunk_file(file_path))
+        files_indexed = 0
+        chunks: list[dict[str, Any]] = []
+        for file_path in _iter_source_files(repo_path):
+            files_indexed += 1
+            chunks.extend(_safe_chunk_file(file_path))
 
-    embeddings = _embed_chunks(chunks)
-    _upsert_chunks(qdrant_client, collection_name, chunks, embeddings)
+        embeddings = _embed_chunks(chunks)
+        _upsert_chunks(qdrant_client, collection_name, chunks, embeddings)
 
-    return IndexSummary(repo_full_name, collection_name, repo_path, files_indexed, len(chunks))
+        logger.info("Indexed %s: %d files, %d chunks.", repo_full_name, files_indexed, len(chunks))
+        return IndexSummary(repo_full_name, collection_name, repo_path, files_indexed, len(chunks))
+    except Exception:
+        logger.exception("Failed to index repository %s", repo_full_name)
+        return IndexSummary(repo_full_name, collection_name, INDEX_ROOT, 0, 0)
+
+
+def _safe_chunk_file(file_path: Path) -> list[dict[str, Any]]:
+    try:
+        return chunker.chunk_file(file_path)
+    except Exception:
+        logger.warning("Skipping file that failed to chunk: %s", file_path, exc_info=True)
+        return []
 
 
 def _ensure_repo_checkout(repo_full_name: str) -> Path:
@@ -144,24 +172,12 @@ def _create_collection_if_needed(qdrant_client: Any, collection_name: str) -> No
     )
 
 
-class _OpenAIEmbedder:
-    """Thin wrapper around the OpenAI embeddings endpoint with an ``encode`` method."""
-
-    def __init__(self, client: Any, model_name: str) -> None:
-        self._client = client
-        self._model_name = model_name
-
-    def encode(self, texts: Sequence[str]) -> list[list[float]]:
-        response = self._client.embeddings.create(model=self._model_name, input=list(texts))
-        return [list(item.embedding) for item in response.data]
-
-
 def _load_embedding_model() -> Any:
     global _embedding_model
     if _embedding_model is None:
-        from openai import OpenAI
+        from sentence_transformers import SentenceTransformer
 
-        _embedding_model = _OpenAIEmbedder(OpenAI(), EMBEDDING_MODEL_NAME)
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
     return _embedding_model
 
 
@@ -172,8 +188,15 @@ def _embed_chunks(chunks: Sequence[dict[str, Any]]) -> list[list[float]]:
     model = _load_embedding_model()
     embeddings: list[list[float]] = []
     for batch in _batched([chunk["text"] for chunk in chunks], BATCH_SIZE):
-        embeddings.extend(model.encode(batch))
+        batch_embeddings = model.encode(batch, batch_size=BATCH_SIZE, convert_to_numpy=True, show_progress_bar=False)
+        embeddings.extend(_normalize_embeddings(batch_embeddings))
     return embeddings
+
+
+def _normalize_embeddings(batch_embeddings: Any) -> list[list[float]]:
+    if hasattr(batch_embeddings, "tolist"):
+        return [list(vector) for vector in batch_embeddings.tolist()]
+    return [list(vector) for vector in batch_embeddings]
 
 
 def _upsert_chunks(
@@ -182,8 +205,17 @@ def _upsert_chunks(
     chunks: Sequence[dict[str, Any]],
     embeddings: Sequence[Sequence[float]],
 ) -> None:
-    points = [qdrant_models.PointStruct(id=chunk["id"], vector=list(vector), payload=chunk) for chunk, vector in zip(chunks, embeddings, strict=True)]
-    qdrant_client.upsert(collection_name=collection_name, points=points)
+    points = [
+        qdrant_models.PointStruct(id=_point_id(chunk["id"]), vector=list(vector), payload=chunk)
+        for chunk, vector in zip(chunks, embeddings, strict=True)
+    ]
+    if points:
+        qdrant_client.upsert(collection_name=collection_name, points=points)
+
+
+def _point_id(chunk_id: str) -> str:
+    """Map a string chunk id to a deterministic UUID accepted by Qdrant."""
+    return str(uuid.uuid5(_POINT_ID_NAMESPACE, chunk_id))
 
 
 def _batched(items: Sequence[str], batch_size: int) -> Iterator[list[str]]:

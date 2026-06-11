@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +11,7 @@ class FakeEmbeddingModel:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
 
-    def encode(self, texts):
+    def encode(self, texts, batch_size=100, convert_to_numpy=True, show_progress_bar=False):
         batch = list(texts)
         self.calls.append(batch)
         return [[float(len(batch))] * indexer.VECTOR_SIZE for _ in batch]
@@ -103,6 +104,20 @@ def test_index_repo_walks_files_batches_embeddings_and_upserts(monkeypatch, tmp_
     assert len(points) == 205
     assert points[0].payload["text"] == "chunk:file_0.py"
     assert len(points[0].vector) == indexer.VECTOR_SIZE
+    # Point id is a deterministic UUID, while the original string id is kept in the payload.
+    assert points[0].id == indexer._point_id(points[0].payload["id"])
+    assert uuid.UUID(points[0].id)
+
+
+def test_point_id_is_deterministic_uuid() -> None:
+    chunk_id = "app/retrieval/indexer.py::index_repo"
+
+    first = indexer._point_id(chunk_id)
+    second = indexer._point_id(chunk_id)
+
+    assert first == second
+    assert uuid.UUID(first)  # raises if not a valid UUID
+    assert indexer._point_id("other::chunk") != first
 
 
 def test_index_repo_skips_when_collection_already_has_points(monkeypatch, tmp_path: Path) -> None:

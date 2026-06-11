@@ -1,9 +1,17 @@
 # Retrieval layer (implemented)
-tree-sitter>=0.22,<0.24
-tree-sitter-python>=0.21
-tree-sitter-javascript>=0.21
-openai>=1.0
+# tree-sitter core must be >=0.24 to load the ABI-15 language packs below.
+tree-sitter>=0.24
+tree-sitter-python>=0.25
+tree-sitter-javascript>=0.25
+
+# Embeddings: local sentence-transformers model (all-MiniLM-L6-v2, 384-dim, no API key)
+sentence-transformers>=2.2
+
+# Vector store
 qdrant-client>=1.7
+
+# Config
+python-dotenv>=1.0
 
 # Tests
 pytest>=8.0

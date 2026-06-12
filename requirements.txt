@@ -11,6 +11,10 @@ sentence-transformers>=2.2
 qdrant-client>=1.7
 rank-bm25>=0.2.2
 
+# Agent (LangGraph state machine + LLM via OpenRouter)
+langgraph>=0.2
+openai>=1.0
+
 # Config
 python-dotenv>=1.0
 

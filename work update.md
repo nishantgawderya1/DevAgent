@@ -1,6 +1,6 @@
 # DevAgent — Work Update
 
-_Last updated: 2026-06-11 (Phase 1 complete)_
+_Last updated: 2026-06-12 (Phase 1 complete; Phase 2 in progress — state, llm, planner done)_
 
 A running log of what's built, what's next, and the phased plan to get from the
 current retrieval layer to the full autonomous issue-resolver described in the
@@ -18,14 +18,14 @@ DevAgent is being built bottom-up. The **retrieval layer is complete**
 | Layer | Status |
 |---|---|
 | Retrieval (chunk → index → retrieve) | ✅ Complete (3 of 3 modules) |
-| Agent nodes (LangGraph) | 🔴 Not started |
+| Agent nodes (LangGraph) | 🟡 In progress (state, llm, planner done) |
 | Backend / webhook (FastAPI) | 🔴 Not started |
 | GitHub integration | 🔴 Not started |
 | Sandbox (Docker exec) | 🔴 Not started |
 | Dashboard (Next.js) | 🔴 Not started |
 | Evals / benchmark | 🔴 Not started |
 
-**Tests:** 13 passing (`pytest -q`).
+**Tests:** 25 passing (`pytest -q`).
 
 ---
 
@@ -106,16 +106,17 @@ This unblocks the Planner and Explorer nodes (the Explorer wraps
 | 1.2 | `indexer.py` | ✅ done |
 | 1.3 | `retriever.py` | ✅ done |
 
-### Phase 2 — Agent (LangGraph state machine)  🔴
-| Step | Module | Purpose |
-|---|---|---|
-| 2.1 | `agent/state.py` | Typed graph state schema |
-| 2.2 | `agent/nodes/planner.py` | Decompose issue → structured subtasks |
-| 2.3 | `agent/nodes/explorer.py` | Call the retriever, assemble context |
-| 2.4 | `agent/nodes/writer.py` | Generate unified diff (LLM via OpenRouter) |
-| 2.5 | `agent/nodes/tester.py` | Run tests in sandbox, parse failures |
-| 2.6 | `agent/nodes/pr.py` | Open the pull request |
-| 2.7 | `agent/graph.py` | Wire nodes + self-repair loop (max 3 retries) |
+### Phase 2 — Agent (LangGraph state machine)  🟡 in progress
+| Step | Module | Purpose | Status |
+|---|---|---|---|
+| 2.1 | `agent/state.py` | Typed graph state schema | ✅ done |
+| — | `agent/llm.py` | Shared OpenRouter chat client (injectable) | ✅ done |
+| 2.2 | `agent/nodes/planner.py` | Decompose issue → structured subtasks | ✅ done |
+| 2.3 | `agent/nodes/explorer.py` | Call the retriever, assemble context | ⏳ next |
+| 2.4 | `agent/nodes/writer.py` | Generate unified diff (LLM via OpenRouter) | 🔴 |
+| 2.5 | `agent/nodes/tester.py` | Run tests in sandbox, parse failures | 🔴 |
+| 2.6 | `agent/nodes/pr.py` | Open the pull request | 🔴 |
+| 2.7 | `agent/graph.py` | Wire nodes + self-repair loop (max 3 retries) | 🔴 |
 
 ### Phase 3 — Backend / webhook  🔴
 | Step | Module | Purpose |

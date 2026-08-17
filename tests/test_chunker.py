@@ -66,6 +66,30 @@ def caller():
     assert "join" in calls
 
 
+def test_chunk_file_includes_decorators(tmp_path: Path) -> None:
+    source = """import functools
+
+
+@functools.lru_cache(maxsize=None)
+def expensive(n):
+    return n * 2
+"""
+    file_path = tmp_path / "decorated.py"
+    file_path.write_text(source, encoding="utf-8")
+
+    chunks = chunk_file(file_path)
+
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    # The chunk spans the decorated_definition, so it starts at the decorator (4),
+    # not at the `def` line (5) — a decorator dropped here is a silent context loss.
+    assert chunk["metadata"]["start_line"] == 4
+    assert "@functools.lru_cache(maxsize=None)" in chunk["text"]
+    # Name and node_type still come from the inner function, not the wrapper.
+    assert chunk["metadata"]["name"] == "expensive"
+    assert chunk["metadata"]["node_type"] == "function"
+
+
 def test_chunk_file_handles_javascript(tmp_path: Path) -> None:
     source = """import { readFile } from 'fs';
 

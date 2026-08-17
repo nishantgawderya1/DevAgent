@@ -12,7 +12,7 @@
 [![Docker](https://img.shields.io/badge/Docker-Sandboxed-2496ED?style=flat&logo=docker&logoColor=white)](https://docker.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[Demo](#demo) · [Architecture](#architecture) · [Quickstart](#quickstart) · [Benchmark](#benchmark) · [Paper](#paper)
+[Architecture](#architecture) · [Tech Stack](#tech-stack) · [Quickstart](#quickstart) · [Supported Languages](#supported-languages)
 
 </div>
 
@@ -30,18 +30,6 @@ Issue opened → Agent plans → Codebase explored → Patch written → Tests p
                                                               Self-repair loop
                                                          (retries on test failure)
 ```
-
----
-
-## Demo
-
-> **"Fix the off-by-one error in the pagination logic"** — opened as a GitHub issue at 11:42pm.
-> DevAgent opened a passing PR at 11:44pm.
-
-<!-- Add demo GIF here once built -->
-![DevAgent Demo](assets/demo.gif)
-
-The dashboard shows the full agent trace — plan, retrieved files, generated diff, test results, retry history.
 
 ---
 
@@ -115,7 +103,7 @@ When generated tests fail, DevAgent doesn't give up. The test runner node parses
 | LLM calls | LangChain (OpenAI / Anthropic / Gemini) |
 | Code parsing | tree-sitter (Python, JavaScript) |
 | Vector store | Qdrant (local Docker) |
-| Code embeddings | `text-embedding-3-small` |
+| Code embeddings | `all-MiniLM-L6-v2` (local, 384-dim) |
 | Sandboxed execution | Docker SDK |
 | Backend API | FastAPI |
 | GitHub integration | PyGithub + Webhooks |
@@ -217,35 +205,12 @@ devagent/
 │       └── client.py        # PyGithub wrapper
 ├── dashboard/               # Next.js frontend
 ├── evals/
-│   ├── benchmark.py         # 50-issue evaluation runner
+│   ├── benchmark.py         # Evaluation runner
 │   └── issues/              # Curated benchmark issue set
 ├── docker-compose.yml
 ├── requirements.txt
 └── README.md
 ```
-
----
-
-## Benchmark
-
-DevAgent was evaluated on **50 real GitHub issues** sourced from popular open-source Python repositories, filtered to `good first issue` bug fixes with existing test coverage.
-
-### Results
-
-| Method | Patch Apply Rate | Test Pass Rate | Valid PR Rate |
-|---|---|---|---|
-| Raw GPT-4o (no retrieval) | 61% | 38% | 31% |
-| SWE-agent | 74% | 52% | 48% |
-| **DevAgent (ours)** | **82%** | **64%** | **58%** |
-
-*Results on 50-issue benchmark subset. Full results in the paper.*
-
-### Key findings
-- AST-aware chunking improved retrieval precision by ~23% over character-split baseline
-- Self-repair loop resolved an additional 18% of initially-failing patches
-- Median time from issue open to PR: 94 seconds
-
-> Note: Benchmark numbers will be updated as evaluation completes. These are preliminary results.
 
 ---
 
@@ -286,19 +251,6 @@ It will struggle with:
 - Repos without any existing test coverage (test runner node has nothing to validate against)
 
 These are known limitations and active areas of improvement.
-
----
-
-## Paper
-
-This project is accompanied by a research paper:
-
-> **DevAgent: Codebase-Aware Autonomous Bug Repair via AST-Augmented Retrieval and Sandboxed Execution**
-> Nishant Gawderya, 2025. *arXiv preprint.*
-
-The paper formalizes the AST-aware chunking strategy, the self-repair loop as a typed LangGraph state machine, and presents the 50-issue benchmark with comparisons against SWE-agent and GPT-4o baselines.
-
-> arXiv link coming soon.
 
 ---
 

@@ -5,14 +5,14 @@ a manual trigger (``/webhook/manual``) for testing without a webhook round-trip.
 Both do the same thing — schedule a background run and return immediately, since
 a full run takes minutes and GitHub expects a webhook response in seconds.
 
-Each run indexes the repository before invoking the graph. ``index_repo`` is
-idempotent and skips collections that already have points, so the cost is paid
-once per repository rather than once per issue — but it has to happen, because
-the explorer node has nothing to retrieve from otherwise.
+Each run indexes the repository before invoking the graph. ``index_repo`` skips
+the work when the collection is already current for the checked-out commit, so
+the cost is paid per repository revision rather than per issue — but it has to
+happen, because the explorer node has nothing to retrieve from otherwise.
 
-Run state is kept in memory. That is deliberate for now: it is enough for the
-Phase 5 dashboard to read, and swapping it for a real store is a contained
-change behind :func:`get_run` / :func:`list_runs`.
+Run state lives in SQLite (:mod:`app.store`) so it survives a restart. Every
+endpoint that starts a run or exposes run contents is behind a bearer token
+(:mod:`app.auth`); ``/webhook`` stays on HMAC because GitHub cannot send one.
 """
 
 from __future__ import annotations
@@ -24,11 +24,10 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 # Load .env BEFORE importing app modules. Some of them resolve configuration at
@@ -36,6 +35,7 @@ from pydantic import BaseModel, Field
 # silently discarded DEVAGENT_INDEX_ROOT and cloned every repo into system temp.
 load_dotenv()
 
+from app import auth, store  # noqa: E402
 from app.agent import graph  # noqa: E402
 from app.agent.state import AgentState  # noqa: E402
 from app.github.client import GitHubClient  # noqa: E402
@@ -63,6 +63,7 @@ def _log_resolved_config() -> None:
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     _log_resolved_config()
+    store.init_db()
     yield
 
 
@@ -72,12 +73,13 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
-_runs: dict[str, dict[str, Any]] = {}
-
 
 class ManualRequest(BaseModel):
     repo: str = Field(..., description="Repository in owner/name form")
     issue_number: int = Field(..., ge=1)
+    triggered_by: str | None = Field(
+        default=None, description="Who asked for this run; recorded for audit"
+    )
 
 
 @app.get("/health")
@@ -85,14 +87,14 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/runs")
+@app.get("/runs", dependencies=[Depends(auth.require_api_token)])
 def list_runs() -> list[dict[str, Any]]:
-    return sorted(_runs.values(), key=lambda run: run["started_at"], reverse=True)
+    return store.list_runs()
 
 
-@app.get("/runs/{run_id}")
+@app.get("/runs/{run_id}", dependencies=[Depends(auth.require_api_token)])
 def get_run(run_id: str) -> dict[str, Any]:
-    run = _runs.get(run_id)
+    run = store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return run
@@ -131,7 +133,7 @@ async def github_webhook(
     return {"status": "accepted", "run_id": run_id}
 
 
-@app.post("/webhook/manual")
+@app.post("/webhook/manual", dependencies=[Depends(auth.require_api_token)])
 def manual_trigger(payload: ManualRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
     """Trigger a run by repo and issue number, fetching the issue text ourselves."""
     try:
@@ -146,6 +148,7 @@ def manual_trigger(payload: ManualRequest, background_tasks: BackgroundTasks) ->
         issue_number=issue["issue_number"],
         issue_title=issue["issue_title"],
         issue_body=issue["issue_body"],
+        triggered_by=payload.triggered_by,
     )
     return {"status": "accepted", "run_id": run_id}
 
@@ -157,18 +160,16 @@ def _schedule(
     issue_number: int,
     issue_title: str,
     issue_body: str,
+    triggered_by: str | None = None,
 ) -> str:
     run_id = uuid.uuid4().hex[:12]
-    _runs[run_id] = {
-        "run_id": run_id,
-        "repo_full_name": repo_full_name,
-        "issue_number": issue_number,
-        "issue_title": issue_title,
-        "status": "queued",
-        "started_at": _now(),
-        "finished_at": None,
-        "state": None,
-    }
+    store.create_run(
+        run_id,
+        repo_full_name=repo_full_name,
+        issue_number=issue_number,
+        issue_title=issue_title,
+        triggered_by=triggered_by,
+    )
     background_tasks.add_task(
         _execute_run, run_id, repo_full_name, issue_number, issue_title, issue_body
     )
@@ -184,8 +185,7 @@ def _execute_run(
     issue_body: str,
 ) -> None:
     """Index the repo, then run the graph. Never raises — the run records the failure."""
-    record = _runs[run_id]
-    record["status"] = "running"
+    store.update_run(run_id, status="running")
 
     try:
         summary = indexer.index_repo(repo_full_name)
@@ -205,14 +205,16 @@ def _execute_run(
             test_runner=DockerTestRunner(),
             github_client=GitHubClient(),
         )
-        record["state"] = dict(final_state)
-        record["status"] = final_state.get("status", "failed")
+        store.update_run(
+            run_id, status=final_state.get("status", "failed"), state=dict(final_state)
+        )
     except Exception as error:  # noqa: BLE001 - a crashed run is a failed run
         logger.exception("Run %s crashed", run_id)
-        record["status"] = "failed"
-        record["state"] = {"status": "failed", "error": str(error)}
+        store.update_run(
+            run_id, status="failed", state={"status": "failed", "error": str(error)}
+        )
     finally:
-        record["finished_at"] = _now()
+        store.update_run(run_id, finished=True)
 
 
 def _verify_signature(raw_body: bytes, signature: str | None) -> None:
@@ -234,6 +236,3 @@ def _verify_signature(raw_body: bytes, signature: str | None) -> None:
     if not hmac.compare_digest(expected, signature):
         raise HTTPException(status_code=401, detail="Signature mismatch")
 
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()

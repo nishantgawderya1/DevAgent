@@ -3,22 +3,26 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app import main
+from app import main, store
 
 
 SECRET = "test-secret"
+TOKEN = "test-api-token"
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
 @pytest.fixture
-def client(monkeypatch):
-    """A test client with the run registry cleared and runs stubbed out."""
-    main._runs.clear()
+def client(monkeypatch, tmp_path: Path):
+    """Test client on a throwaway DB, with runs stubbed out."""
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
+    monkeypatch.setenv("DEVAGENT_API_TOKEN", TOKEN)
+    monkeypatch.setenv("DEVAGENT_DB_PATH", str(tmp_path / "runs.db"))
 
     executed: list[tuple[Any, ...]] = []
     monkeypatch.setattr(main, "_execute_run", lambda *args: executed.append(args))
@@ -42,25 +46,80 @@ def _issue_payload(number: int = 7, action: str = "opened") -> bytes:
     ).encode()
 
 
-def test_health(client) -> None:
+def _post_webhook(client, body: bytes | None = None, event: str = "issues"):
+    body = _issue_payload() if body is None else body
+    return client.post(
+        "/webhook",
+        content=body,
+        headers={"X-Hub-Signature-256": _sign(body), "X-GitHub-Event": event},
+    )
+
+
+# --- health -------------------------------------------------------------------
+
+
+def test_health_needs_no_token(client) -> None:
     assert client.get("/health").json() == {"status": "ok"}
 
 
-def test_webhook_accepts_a_signed_issue_opened_event(client) -> None:
-    body = _issue_payload()
+# --- API token ----------------------------------------------------------------
 
-    response = client.post(
-        "/webhook",
-        content=body,
-        headers={"X-Hub-Signature-256": _sign(body), "X-GitHub-Event": "issues"},
-    )
+
+def test_read_endpoints_reject_a_missing_token(client) -> None:
+    assert client.get("/runs").status_code == 401
+    assert client.get("/runs/anything").status_code == 401
+
+
+def test_read_endpoints_reject_a_wrong_token(client) -> None:
+    response = client.get("/runs", headers={"Authorization": "Bearer nope"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid API token"
+
+
+def test_malformed_authorization_header_is_rejected(client) -> None:
+    assert client.get("/runs", headers={"Authorization": TOKEN}).status_code == 401
+    assert client.get("/runs", headers={"Authorization": "Basic abc"}).status_code == 401
+    assert client.get("/runs", headers={"Authorization": "Bearer "}).status_code == 401
+
+
+def test_manual_trigger_requires_a_token(client) -> None:
+    response = client.post("/webhook/manual", json={"repo": "owner/repo", "issue_number": 1})
+
+    assert response.status_code == 401
+    assert client.executed == []
+
+
+def test_endpoints_fail_closed_when_no_token_is_configured(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("DEVAGENT_API_TOKEN", raising=False)
+    monkeypatch.setenv("DEVAGENT_DB_PATH", str(tmp_path / "runs.db"))
+
+    with TestClient(main.app) as unconfigured:
+        response = unconfigured.get("/runs", headers=AUTH)
+
+    # An unset token must not mean "allow everyone" on endpoints this sensitive.
+    assert response.status_code == 503
+    assert "DEVAGENT_API_TOKEN" in response.json()["detail"]
+
+
+# --- webhook ------------------------------------------------------------------
+
+
+def test_webhook_accepts_a_signed_issue_opened_event(client) -> None:
+    response = _post_webhook(client)
 
     assert response.status_code == 200
-    assert response.json()["status"] == "accepted"
     run_id = response.json()["run_id"]
-    assert main._runs[run_id]["repo_full_name"] == "owner/repo"
-    assert main._runs[run_id]["issue_number"] == 7
+    stored = store.get_run(run_id)
+    assert stored["repo_full_name"] == "owner/repo"
+    assert stored["issue_number"] == 7
+    assert stored["status"] == "queued"
     assert client.executed == [(run_id, "owner/repo", 7, "Fix pagination", "Off-by-one")]
+
+
+def test_webhook_needs_no_api_token(client) -> None:
+    # GitHub cannot send a bearer token, so this path stays on HMAC alone.
+    assert _post_webhook(client).status_code == 200
 
 
 def test_webhook_rejects_a_bad_signature(client) -> None:
@@ -69,7 +128,7 @@ def test_webhook_rejects_a_bad_signature(client) -> None:
     response = client.post(
         "/webhook",
         content=body,
-        headers={"X-Hub-Signature-256": _sign(body, "wrong-secret"), "X-GitHub-Event": "issues"},
+        headers={"X-Hub-Signature-256": _sign(body, "wrong"), "X-GitHub-Event": "issues"},
     )
 
     assert response.status_code == 401
@@ -77,17 +136,17 @@ def test_webhook_rejects_a_bad_signature(client) -> None:
 
 
 def test_webhook_rejects_a_missing_signature(client) -> None:
-    body = _issue_payload()
-
-    response = client.post("/webhook", content=body, headers={"X-GitHub-Event": "issues"})
+    response = client.post(
+        "/webhook", content=_issue_payload(), headers={"X-GitHub-Event": "issues"}
+    )
 
     assert response.status_code == 401
     assert client.executed == []
 
 
-def test_webhook_fails_closed_when_no_secret_is_configured(monkeypatch) -> None:
-    main._runs.clear()
+def test_webhook_fails_closed_without_a_secret(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.delenv("GITHUB_WEBHOOK_SECRET", raising=False)
+    monkeypatch.setenv("DEVAGENT_DB_PATH", str(tmp_path / "runs.db"))
     body = _issue_payload()
 
     with TestClient(main.app) as unconfigured:
@@ -97,56 +156,47 @@ def test_webhook_fails_closed_when_no_secret_is_configured(monkeypatch) -> None:
             headers={"X-Hub-Signature-256": _sign(body), "X-GitHub-Event": "issues"},
         )
 
-    # An unset secret must not mean "accept everything" — this endpoint starts runs.
     assert response.status_code == 503
-    assert main._runs == {}
 
 
 def test_webhook_ignores_other_events(client) -> None:
-    body = _issue_payload()
-
-    response = client.post(
-        "/webhook",
-        content=body,
-        headers={"X-Hub-Signature-256": _sign(body), "X-GitHub-Event": "push"},
-    )
-
-    assert response.json()["status"] == "ignored"
+    assert _post_webhook(client, event="push").json()["status"] == "ignored"
     assert client.executed == []
 
 
 def test_webhook_ignores_non_opened_actions(client) -> None:
-    body = _issue_payload(action="closed")
-
-    response = client.post(
-        "/webhook",
-        content=body,
-        headers={"X-Hub-Signature-256": _sign(body), "X-GitHub-Event": "issues"},
-    )
+    response = _post_webhook(client, body=_issue_payload(action="closed"))
 
     assert response.json()["status"] == "ignored"
     assert client.executed == []
 
 
+# --- manual trigger -----------------------------------------------------------
+
+
+class _FakeGitHubClient:
+    def get_issue(self, repo: str, number: int) -> dict[str, Any]:
+        return {
+            "repo_full_name": repo,
+            "issue_number": number,
+            "issue_title": "Fix pagination",
+            "issue_body": "Off-by-one",
+        }
+
+
 def test_manual_trigger_reads_the_issue_and_schedules(client, monkeypatch) -> None:
-    class FakeGitHubClient:
-        def get_issue(self, repo: str, number: int) -> dict[str, Any]:
-            return {
-                "repo_full_name": repo,
-                "issue_number": number,
-                "issue_title": "Fix pagination",
-                "issue_body": "Off-by-one",
-            }
+    monkeypatch.setattr(main, "GitHubClient", _FakeGitHubClient)
 
-    monkeypatch.setattr(main, "GitHubClient", FakeGitHubClient)
-
-    response = client.post("/webhook/manual", json={"repo": "owner/repo", "issue_number": 42})
+    response = client.post(
+        "/webhook/manual",
+        json={"repo": "owner/repo", "issue_number": 42, "triggered_by": "nishant"},
+        headers=AUTH,
+    )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "accepted"
-    assert client.executed == [
-        (response.json()["run_id"], "owner/repo", 42, "Fix pagination", "Off-by-one")
-    ]
+    run_id = response.json()["run_id"]
+    assert store.get_run(run_id)["triggered_by"] == "nishant"
+    assert client.executed == [(run_id, "owner/repo", 42, "Fix pagination", "Off-by-one")]
 
 
 def test_manual_trigger_surfaces_a_github_failure(client, monkeypatch) -> None:
@@ -156,7 +206,9 @@ def test_manual_trigger_surfaces_a_github_failure(client, monkeypatch) -> None:
 
     monkeypatch.setattr(main, "GitHubClient", BoomClient)
 
-    response = client.post("/webhook/manual", json={"repo": "owner/repo", "issue_number": 42})
+    response = client.post(
+        "/webhook/manual", json={"repo": "owner/repo", "issue_number": 42}, headers=AUTH
+    )
 
     assert response.status_code == 502
     assert "404 Not Found" in response.json()["detail"]
@@ -164,26 +216,37 @@ def test_manual_trigger_surfaces_a_github_failure(client, monkeypatch) -> None:
 
 
 def test_manual_trigger_validates_its_payload(client) -> None:
-    assert client.post("/webhook/manual", json={"repo": "owner/repo"}).status_code == 422
+    assert client.post("/webhook/manual", json={"repo": "o/r"}, headers=AUTH).status_code == 422
     assert (
-        client.post("/webhook/manual", json={"repo": "owner/repo", "issue_number": 0}).status_code
+        client.post(
+            "/webhook/manual", json={"repo": "o/r", "issue_number": 0}, headers=AUTH
+        ).status_code
         == 422
     )
 
 
-def test_runs_endpoints_expose_run_state(client) -> None:
-    body = _issue_payload()
-    run_id = client.post(
-        "/webhook",
-        content=body,
-        headers={"X-Hub-Signature-256": _sign(body), "X-GitHub-Event": "issues"},
-    ).json()["run_id"]
+# --- run registry -------------------------------------------------------------
 
-    listed = client.get("/runs").json()
+
+def test_runs_endpoints_expose_stored_runs(client) -> None:
+    run_id = _post_webhook(client).json()["run_id"]
+
+    listed = client.get("/runs", headers=AUTH).json()
     assert [run["run_id"] for run in listed] == [run_id]
 
-    detail = client.get(f"/runs/{run_id}").json()
+    detail = client.get(f"/runs/{run_id}", headers=AUTH).json()
     assert detail["issue_title"] == "Fix pagination"
     assert detail["status"] == "queued"
 
-    assert client.get("/runs/does-not-exist").status_code == 404
+    assert client.get("/runs/does-not-exist", headers=AUTH).status_code == 404
+
+
+def test_runs_survive_an_app_restart(client) -> None:
+    """The whole point of the store: a restart used to erase every run."""
+    run_id = _post_webhook(client).json()["run_id"]
+
+    # Same DB path from the fixture env, brand new app instance.
+    with TestClient(main.app) as restarted:
+        listed = restarted.get("/runs", headers=AUTH).json()
+
+    assert [run["run_id"] for run in listed] == [run_id]

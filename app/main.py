@@ -23,26 +23,54 @@ import json
 import logging
 import os
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.agent import graph
-from app.agent.state import AgentState
-from app.github.client import GitHubClient
-from app.retrieval import indexer
-from app.sandbox.docker import DockerTestRunner
-
-
+# Load .env BEFORE importing app modules. Some of them resolve configuration at
+# import time -- indexer.INDEX_ROOT is the live example -- so loading afterwards
+# silently discarded DEVAGENT_INDEX_ROOT and cloned every repo into system temp.
 load_dotenv()
+
+from app.agent import graph  # noqa: E402
+from app.agent.state import AgentState  # noqa: E402
+from app.github.client import GitHubClient  # noqa: E402
+from app.retrieval import indexer  # noqa: E402
+from app.sandbox.docker import DockerTestRunner  # noqa: E402
+
 
 logging.basicConfig(level=os.getenv("DEVAGENT_LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="DevAgent", description="Autonomous GitHub issue resolver")
+def _log_resolved_config() -> None:
+    """Surface the paths we actually resolved, not the ones .env asked for.
+
+    Config that silently falls back is the hardest kind to debug, so report what
+    took effect at boot rather than discovering it three steps into a run.
+    """
+    logger.info("Index root: %s", indexer.INDEX_ROOT)
+    logger.info(
+        "Webhook secret configured: %s | GitHub credentials: %s",
+        bool(os.getenv("GITHUB_WEBHOOK_SECRET")),
+        bool(os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_APP_ID")),
+    )
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    _log_resolved_config()
+    yield
+
+
+app = FastAPI(
+    title="DevAgent",
+    description="Autonomous GitHub issue resolver",
+    lifespan=_lifespan,
+)
 
 _runs: dict[str, dict[str, Any]] = {}
 

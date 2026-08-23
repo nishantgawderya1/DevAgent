@@ -141,7 +141,7 @@ def test_index_repo_skips_when_collection_already_has_points(monkeypatch, tmp_pa
 
 
 def test_ensure_repo_checkout_clones_when_missing(tmp_path: Path, monkeypatch) -> None:
-    destination = tmp_path / "flask"
+    destination = tmp_path / "owner__flask"
     calls: list[tuple[list[str], bool]] = []
 
     def fake_run(command, check):
@@ -156,3 +156,83 @@ def test_ensure_repo_checkout_clones_when_missing(tmp_path: Path, monkeypatch) -
 
     assert result == destination
     assert calls == [(["git", "clone", "https://github.com/owner/flask.git", str(destination)], True)]
+
+
+def test_checkout_dirs_do_not_collide_across_owners(tmp_path: Path, monkeypatch) -> None:
+    """Two owners can publish the same repo name; they must not share a tree.
+
+    Qdrant already namespaced these apart, so a shared directory meant retrieval
+    read one repo's index while the patch was applied to the other's code.
+    """
+    created: list[str] = []
+
+    def fake_run(command, check):
+        destination = Path(command[-1])
+        destination.mkdir(parents=True, exist_ok=True)
+        created.append(destination.name)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(indexer, "INDEX_ROOT", tmp_path)
+    monkeypatch.setattr(indexer.subprocess, "run", fake_run)
+
+    alice = indexer._ensure_repo_checkout("alice/utils")
+    bob = indexer._ensure_repo_checkout("bob/utils")
+
+    assert alice != bob
+    assert created == ["alice__utils", "bob__utils"]
+    # The directory key must match the Qdrant collection key, or the two drift.
+    assert alice.name == indexer._collection_name("alice/utils")
+
+
+def test_existing_checkout_is_synced_not_returned_stale(tmp_path: Path, monkeypatch) -> None:
+    """A stale tree would make the PR revert every upstream commit since cloning."""
+    repo_path = tmp_path / "owner__flask"
+    (repo_path / ".git").mkdir(parents=True)
+
+    git_calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        git_calls.append(list(command)[1:])
+        if "symbolic-ref" in command:
+            return SimpleNamespace(returncode=0, stdout="refs/remotes/origin/main\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(indexer, "INDEX_ROOT", tmp_path)
+    monkeypatch.setattr(indexer.subprocess, "run", fake_run)
+
+    result = indexer._ensure_repo_checkout("owner/flask")
+
+    assert result == repo_path
+    verbs = [call[0] for call in git_calls]
+    assert "fetch" in verbs
+    assert "reset" in verbs
+    assert "clone" not in verbs  # reuse the tree, but only after syncing it
+
+
+def test_reindex_is_skipped_only_when_the_sha_still_matches(tmp_path: Path, monkeypatch) -> None:
+    repo_path = tmp_path / "owner__flask"
+    repo_path.mkdir(parents=True)
+
+    monkeypatch.setattr(indexer, "INDEX_ROOT", tmp_path)
+    monkeypatch.setattr(indexer, "_ensure_repo_checkout", lambda name: repo_path)
+    monkeypatch.setattr(indexer, "_get_qdrant_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(indexer, "_collection_has_points", lambda client, name: True)
+    monkeypatch.setattr(indexer, "_head_sha", lambda path: "abc123")
+
+    indexer._write_indexed_sha("owner__flask", "abc123")
+    summary = indexer.index_repo("owner/flask")
+    assert summary.chunks_indexed == 0  # current: skipped
+
+    # The checkout moved on; the collection now describes code that is gone.
+    dropped: list[str] = []
+    monkeypatch.setattr(indexer, "_head_sha", lambda path: "def456")
+    monkeypatch.setattr(indexer, "_drop_collection", lambda c, n: dropped.append(n))
+    monkeypatch.setattr(indexer, "_create_collection_if_needed", lambda c, n: None)
+    monkeypatch.setattr(indexer, "_iter_source_files", lambda path: iter(()))
+    monkeypatch.setattr(indexer, "_embed_chunks", lambda chunks: [])
+    monkeypatch.setattr(indexer, "_upsert_chunks", lambda c, n, ch, e: None)
+
+    indexer.index_repo("owner/flask")
+
+    assert dropped == ["owner__flask"]
+    assert indexer._read_indexed_sha("owner__flask") == "def456"

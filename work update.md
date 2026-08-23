@@ -1,6 +1,6 @@
 # DevAgent — Work Update
 
-_Last updated: 2026-08-18 (Phases 1–3 complete — webhook, sandbox and GitHub backends are in; the loop closes)_
+_Last updated: 2026-08-23 (v1 milestones A–C landed — correctness, auth, persistence, Nemotron, fixture. Awaiting the first live run.)_
 
 A running log of what's built, what's next, and the phased plan to get from the
 current retrieval layer to the full autonomous issue-resolver described in the
@@ -25,14 +25,13 @@ PR. What remains is *observation and evidence* — dashboard, tracing, benchmark
 | Dashboard (Next.js) | 🔴 Not started |
 | Evals / benchmark | 🔴 Not started |
 
-**Tests:** 87 passing (`pytest -q`).
+**Tests:** 127 passing (`pytest -q`).
 
-> **Runnable today?** The app boots and every route is live. What has *not*
-> happened yet is a real run: no live LLM call, no container actually executing
-> a suite, no PR opened against a real repository. Every backend is tested
-> against fakes and against real local git, but the first true end-to-end run
-> still needs credentials and a running Docker daemon. That is the immediate
-> next task, and it is where the interesting bugs will be.
+> **Runnable today?** The app boots, every route is live, the API is
+> authenticated and run history survives a restart. What has *not* happened yet
+> is a real run: no live LLM call, no container actually executing a suite, no PR
+> opened against a real repository. Everything below rung 1 of the testing ladder
+> is unproven, and that is now the only thing between here and v1.
 
 ---
 
@@ -138,7 +137,42 @@ graph runnable offline in tests.
   `ignore_errors=True` hides that rather than fixing it, so every run leaked its
   workspace. Found by a cleanup assertion in the sandbox tests.
 
-### Tests (57 total)
+### v1 hardening (milestones A–C) ✅
+Found by auditing the integration seams before attempting a live run. Every one
+of these would have made that run fail in a misleading way.
+
+- **Checkout collision** — the directory was keyed on the trailing path segment,
+  so `alice/utils` and `bob/utils` shared one tree while Qdrant kept them apart.
+  Retrieval read one repo's index while the patch landed on the other's code.
+  Now keyed on `_collection_name` so both schemes agree.
+- **Checkout staleness** — nothing ever fetched. Since the PR node branches from
+  this tree and opens against the remote default branch, a stale tree would have
+  produced a PR containing **a revert of every upstream commit since the clone**.
+  Existing checkouts are now fetched and hard-reset before use.
+- **Stale index** — with checkouts moving, the "already populated, skip"
+  short-circuit would have left the index describing deleted code. The indexed
+  commit is recorded and the collection rebuilt when HEAD differs.
+- **`.env` half-ignored** — `load_dotenv()` ran *after* the app imports while
+  `INDEX_ROOT` resolves at import time, so `DEVAGENT_INDEX_ROOT` was silently
+  discarded and every repo cloned into system temp. Verified before and after.
+- **Secret not ignored** — `.env.example` points the GitHub App key at
+  `./certs/`, which was not gitignored.
+- **Open API** — `/runs`, `/runs/{id}` and `/webhook/manual` are now behind a
+  bearer token (`app/auth.py`), failing closed when unset. `/webhook` stays on
+  HMAC since GitHub cannot send a token.
+- **Volatile history** — runs moved from a module dict to SQLite (`app/store.py`,
+  stdlib `sqlite3`). Verified surviving a real restart.
+- **Nemotron** — `llm.py` now reads `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL`
+  and defaults to NVIDIA NIM, with `OPENROUTER_*` still honoured. The planner was
+  the only JSON-mode caller and the first node, making it a single point of
+  failure on providers that reject `response_format`; it retries once without it
+  and now tolerates fenced or prose-wrapped replies.
+- **Unbounded runs** — a per-request LLM timeout plus a wall-clock run ceiling.
+- **`fixtures/pagination-bug/`** — the end-to-end target, with the bug
+  deliberately split across two files so a successful run proves AST dependency
+  expansion rather than just the plumbing.
+
+### Tests (127 total)
 - `tests/test_chunker.py` — Python chunks, file-level fallback, callee
   extraction, JavaScript chunking, decorator capture (regression).
 - `tests/test_indexer.py` — file walk + skip-dirs, per-file chunking, batch
@@ -173,6 +207,35 @@ graph runnable offline in tests.
 
 ## What's next (immediate)
 
+**The only thing left for v1 is the first real run.** No more code is required
+to attempt it — what it needs is credentials, a Docker daemon and a target.
+
+Climb the ladder rather than debugging five unproven integrations at once:
+
+| Rung | What runs | Needs | Proves |
+|---|---|---|---|
+| 0 | `pytest -q` | — | ✅ 127 green |
+| 1a | `index_repo` on the fixture | Qdrant | chunks land |
+| 1b | `retrieve("page size clamped")` | Qdrant | `clamp_page_size` returns **as `expanded`** |
+| 1c | one real `llm.complete` | Nemotron key | auth works, plan parses |
+| 1d | sandbox + a hand-written good patch | Docker | container runs pytest, exit 0 |
+| 1e | GitHub client + hand-written patch | GH token | branch pushed, PR clean |
+| 2 | graph, real LLM, fake runner/github | Nemotron key | **prompt iteration lives here** |
+| 3 | full `/webhook/manual` | everything | v1 |
+| 4 | rung 3 × 10 | everything | a pass rate worth quoting |
+
+Rung 2 is the cost saver — most remaining effort is writer-prompt iteration and
+it needs neither Docker nor GitHub. Rung 1b is the one that tests the project's
+actual thesis.
+
+Setup: `pip install -r requirements.txt`, fill `.env` (`LLM_API_KEY`,
+`GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`, `DEVAGENT_API_TOKEN`),
+`docker-compose up -d`, then
+`python scripts/publish_fixture.py pagination-bug --repo <owner>/devagent-fixture --push`
+and open `fixtures/pagination-bug/ISSUE.md` as an issue there.
+
+<details><summary>Superseded plan</summary>
+
 **Phases 1–3 are complete and the app boots** — `/health`, `/runs`,
 `/runs/{id}`, `/webhook`, `/webhook/manual` all respond. The next task is not
 more code, it is **the first real run**:
@@ -186,6 +249,8 @@ more code, it is **the first real run**:
 
 Only then does Phase 4 (MLflow/LangSmith) earn its place, because tracing is
 most useful once there is a real run to trace.
+
+</details>
 
 ---
 

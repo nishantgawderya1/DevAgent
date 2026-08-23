@@ -74,3 +74,87 @@ def test_plan_issue_fails_on_invalid_json() -> None:
 
     assert update["status"] == "failed"
     assert "planning failed" in update["error"].lower()
+
+
+class FlakyJSONModeClient:
+    """Rejects response_format the way a model without JSON mode does."""
+
+    def __init__(self, content: str, error: Exception) -> None:
+        self._content = content
+        self._error = error
+        self.calls: list[dict[str, Any]] = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        if "response_format" in kwargs:
+            raise self._error
+        message = SimpleNamespace(content=self._content)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def _bad_request(message: str) -> Exception:
+    error = ValueError(message)
+    error.status_code = 400  # type: ignore[attr-defined]
+    return error
+
+
+def test_plan_issue_retries_without_json_mode_when_rejected() -> None:
+    client = FlakyJSONModeClient(
+        json.dumps({"subtasks": ["Locate the bug", "Fix it"]}),
+        _bad_request("400: response_format is not supported for this model"),
+    )
+
+    update = planner.plan_issue(_state(), client=client)
+
+    assert update["status"] == "exploring"
+    assert len(update["plan"]) == 2
+    # Tried JSON mode first, then fell back once.
+    assert "response_format" in client.calls[0]
+    assert "response_format" not in client.calls[1]
+    assert len(client.calls) == 2
+
+
+def test_plan_issue_does_not_retry_on_an_unrelated_error() -> None:
+    """A real outage must surface, not cost a second call and the same failure."""
+
+    class DownClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def _create(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            raise RuntimeError("503 upstream connect error")
+
+    client = DownClient()
+    update = planner.plan_issue(_state(), client=client)
+
+    assert update["status"] == "failed"
+    assert "503" in update["error"]
+    assert len(client.calls) == 1
+
+
+def test_plan_issue_unwraps_a_fenced_reply() -> None:
+    fenced = '```json\n{"subtasks": ["Step one", "Step two"]}\n```'
+
+    update = planner.plan_issue(_state(), client=FakeLLMClient(fenced))
+
+    assert update["status"] == "exploring"
+    assert [task["description"] for task in update["plan"]] == ["Step one", "Step two"]
+
+
+def test_plan_issue_recovers_json_from_surrounding_prose() -> None:
+    chatty = 'Sure! Here is the plan:\n{"subtasks": ["Only step"]}\nHope that helps.'
+
+    update = planner.plan_issue(_state(), client=FakeLLMClient(chatty))
+
+    assert update["status"] == "exploring"
+    assert update["plan"][0]["description"] == "Only step"
+
+
+def test_plan_issue_still_fails_when_there_is_no_json_at_all() -> None:
+    update = planner.plan_issue(_state(), client=FakeLLMClient("I could not understand the issue."))
+
+    assert update["status"] == "failed"
+    assert "planning failed" in update["error"].lower()

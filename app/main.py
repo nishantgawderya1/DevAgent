@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
@@ -45,6 +46,8 @@ from app.sandbox.docker import DockerTestRunner  # noqa: E402
 
 logging.basicConfig(level=os.getenv("DEVAGENT_LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
+
+DEFAULT_RUN_TIMEOUT_SECONDS = 1800.0
 
 def _log_resolved_config() -> None:
     """Surface the paths we actually resolved, not the ones .env asked for.
@@ -197,13 +200,8 @@ def _execute_run(
             summary.chunks_indexed,
         )
 
-        final_state: AgentState = graph.run(
-            repo_full_name,
-            issue_number,
-            issue_title,
-            issue_body,
-            test_runner=DockerTestRunner(),
-            github_client=GitHubClient(),
+        final_state: AgentState = _run_graph_with_deadline(
+            repo_full_name, issue_number, issue_title, issue_body
         )
         store.update_run(
             run_id, status=final_state.get("status", "failed"), state=dict(final_state)
@@ -215,6 +213,50 @@ def _execute_run(
         )
     finally:
         store.update_run(run_id, finished=True)
+
+
+def _run_graph_with_deadline(
+    repo_full_name: str, issue_number: int, issue_title: str, issue_body: str
+) -> AgentState:
+    """Run the graph, giving up after ``DEVAGENT_RUN_TIMEOUT_SECONDS``.
+
+    Individual steps already have their own limits — the LLM client has a
+    per-request timeout and the sandbox bounds ``container.wait`` — but their
+    worst cases compound across the self-repair loop. This puts a single ceiling
+    on the whole run.
+
+    A timed-out graph cannot be cancelled mid-flight; Python threads have no safe
+    kill. The worker is abandoned to finish on its own while the run is recorded
+    as failed, which keeps the run record and the API honest even though the
+    thread lingers.
+    """
+    timeout = _run_timeout()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            graph.run,
+            repo_full_name,
+            issue_number,
+            issue_title,
+            issue_body,
+            test_runner=DockerTestRunner(),
+            github_client=GitHubClient(),
+        )
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeout:
+            future.cancel()
+            raise TimeoutError(f"Run exceeded {timeout:.0f}s and was abandoned.") from None
+
+
+def _run_timeout() -> float:
+    raw = os.getenv("DEVAGENT_RUN_TIMEOUT_SECONDS")
+    if not raw:
+        return DEFAULT_RUN_TIMEOUT_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("DEVAGENT_RUN_TIMEOUT_SECONDS=%r is not a number; using default.", raw)
+        return DEFAULT_RUN_TIMEOUT_SECONDS
 
 
 def _verify_signature(raw_body: bytes, signature: str | None) -> None:

@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -250,3 +251,44 @@ def test_runs_survive_an_app_restart(client) -> None:
         listed = restarted.get("/runs", headers=AUTH).json()
 
     assert [run["run_id"] for run in listed] == [run_id]
+
+
+# --- run deadline ---------------------------------------------------------------
+
+
+def test_run_timeout_defaults_and_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("DEVAGENT_RUN_TIMEOUT_SECONDS", raising=False)
+    assert main._run_timeout() == main.DEFAULT_RUN_TIMEOUT_SECONDS
+
+    monkeypatch.setenv("DEVAGENT_RUN_TIMEOUT_SECONDS", "45")
+    assert main._run_timeout() == 45.0
+
+    # A typo must not remove the ceiling entirely.
+    monkeypatch.setenv("DEVAGENT_RUN_TIMEOUT_SECONDS", "half an hour")
+    assert main._run_timeout() == main.DEFAULT_RUN_TIMEOUT_SECONDS
+
+
+def test_a_hung_graph_is_recorded_as_a_failed_run(monkeypatch, tmp_path: Path) -> None:
+    import time
+
+    monkeypatch.setenv("DEVAGENT_DB_PATH", str(tmp_path / "runs.db"))
+    monkeypatch.setenv("DEVAGENT_RUN_TIMEOUT_SECONDS", "0.2")
+    monkeypatch.setattr(main, "DockerTestRunner", lambda *a, **k: None)
+    monkeypatch.setattr(main, "GitHubClient", lambda *a, **k: None)
+    monkeypatch.setattr(main.indexer, "index_repo", lambda repo: SimpleNamespace(
+        files_indexed=0, chunks_indexed=0
+    ))
+
+    def hang(*args, **kwargs):
+        time.sleep(5)
+
+    monkeypatch.setattr(main.graph, "run", hang)
+    store.init_db()
+    store.create_run("hung", repo_full_name="owner/repo", issue_number=1, issue_title="t")
+
+    main._execute_run("hung", "owner/repo", 1, "t", "b")
+
+    record = store.get_run("hung")
+    assert record["status"] == "failed"
+    assert "exceeded" in record["state"]["error"]
+    assert record["finished_at"] is not None

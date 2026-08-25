@@ -22,8 +22,8 @@ Asking for a page larger than the maximum returns 51 items instead of 50.
 
 ### What should happen
 
-`MAX_PAGE_SIZE` is 50, so an over-large request should be clamped to exactly 50
-items — and the reported `page_size` should agree.
+The documented maximum is 50, so an over-large request should come back with
+exactly 50 items — and the reported `page_size` should agree.
 
 ### Reproducing
 
@@ -43,5 +43,5 @@ Both report `assert 51 == 50`.
 
 ### Notes
 
-Pages requested below the maximum come back the right length, so the problem
-only shows at the upper bound.
+Pages requested below the maximum come back the right length. Only requests at
+or above the limit are affected, and they are always over by exactly one.

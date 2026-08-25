@@ -127,3 +127,81 @@ def test_write_patch_fails_when_reply_has_no_diff() -> None:
 
     assert update["status"] == "failed"
     assert "no usable diff" in update["error"].lower()
+
+
+def test_malformed_hunk_header_is_repaired() -> None:
+    """Verbatim from a live run: the +range was missing entirely.
+
+    git rejects this as a corrupt patch before it looks at the change, and
+    `git apply --recount` cannot help because it still needs a parseable header.
+    The model had the edit exactly right; only the arithmetic was wrong.
+    """
+    reply = (
+        "--- a/pagelib/utils.py\n"
+        "+++ b/pagelib/utils.py\n"
+        "@@ -7,7 @@ def clamp_page_size(requested, maximum):\n"
+        '     """Clamp a requested page size into the allowed range."""\n'
+        "     if requested < 1:\n"
+        "         return 1\n"
+        "-    return min(requested, maximum + 1)\n"
+        "+    return min(requested, maximum)\n"
+    )
+
+    diff = writer._extract_diff(reply)
+
+    # 3 context + 1 removed = 4 old; 3 context + 1 added = 4 new.
+    assert "@@ -7,4 +7,4 @@" in diff
+    assert "-    return min(requested, maximum + 1)" in diff
+    assert "+    return min(requested, maximum)" in diff
+
+
+def test_correct_hunk_headers_are_left_alone() -> None:
+    """An already-correct header must survive normalisation untouched."""
+    reply = (
+        "--- a/api.py\n"
+        "+++ b/api.py\n"
+        "@@ -10,3 +10,3 @@\n"
+        " before\n"
+        "-old\n"
+        "+new\n"
+        " after\n"
+    )
+
+    # 2 context + 1 removed = 3 old; 2 context + 1 added = 3 new. Already right.
+    assert "@@ -10,3 +10,3 @@" in writer._extract_diff(reply)
+
+
+def test_wrong_counts_are_recomputed_from_the_body() -> None:
+    reply = (
+        "--- a/api.py\n"
+        "+++ b/api.py\n"
+        "@@ -1,99 +1,99 @@\n"
+        " keep\n"
+        "-drop\n"
+        "+add\n"
+        "+add two\n"
+    )
+
+    # Body is the source of truth: 2 old (keep+drop), 3 new (keep+2 adds).
+    assert "@@ -1,2 +1,3 @@" in writer._extract_diff(reply)
+
+
+def test_multiple_hunks_are_each_recomputed() -> None:
+    reply = (
+        "--- a/api.py\n"
+        "+++ b/api.py\n"
+        "@@ -1 +1 @@\n"
+        " a\n"
+        "-b\n"
+        "+c\n"
+        "@@ -20 +20 @@\n"
+        " x\n"
+        " y\n"
+        "-z\n"
+        "+w\n"
+    )
+
+    diff = writer._extract_diff(reply)
+
+    assert "@@ -1,2 +1,2 @@" in diff
+    assert "@@ -20,3 +20,3 @@" in diff

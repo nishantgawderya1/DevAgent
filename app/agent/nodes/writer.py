@@ -34,6 +34,8 @@ _SYSTEM_PROMPT = (
 _TARGET_FILE_RE = re.compile(r"^\+\+\+ (?:b/)?(\S+)", re.MULTILINE)
 _FENCE_RE = re.compile(r"^```[a-zA-Z]*\n(.*?)\n```", re.DOTALL | re.MULTILINE)
 _DIFF_START_RE = re.compile(r"^(diff --git |--- )", re.MULTILINE)
+# Tolerant: the counts, and even the whole +range, are frequently wrong or absent.
+_HUNK_RE = re.compile(r"^@@\s*-(\d+)(?:,(\d+))?\s*(?:\+(\d+)(?:,(\d+))?)?\s*@@(.*)$")
 
 
 def write_patch(state: AgentState, *, client: Any | None = None) -> AgentState:
@@ -148,7 +150,58 @@ def _extract_diff(content: str) -> str:
     start = _DIFF_START_RE.search(content)
     if start is None:
         return ""
-    return content[start.start() :].strip()
+    return _normalize_hunk_headers(content[start.start() :].strip())
+
+
+def _normalize_hunk_headers(diff: str) -> str:
+    """Recompute the line counts in each ``@@`` header from the hunk body.
+
+    Models get the edit right and the hunk arithmetic wrong. Live runs produced
+    headers like ``@@ -7,7 @@`` -- the ``+`` range missing entirely -- which git
+    rejects as a corrupt patch before it ever looks at the change. ``git apply
+    --recount`` does not help, because it still needs a parseable header.
+
+    The body is the source of truth, so counts are derived from it. Start lines
+    are left alone: git already searches nearby for matching context, so a small
+    offset is survivable in a way that a malformed header is not.
+    """
+    lines = diff.splitlines()
+    out: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        match = _HUNK_RE.match(lines[index])
+        if match is None:
+            out.append(lines[index])
+            index += 1
+            continue
+
+        body, index = _hunk_body(lines, index + 1)
+        old_start = int(match.group(1))
+        new_start = int(match.group(3)) if match.group(3) else old_start
+        old_count = sum(1 for line in body if not line.startswith(("+", "\\")))
+        new_count = sum(1 for line in body if not line.startswith(("-", "\\")))
+
+        out.append(f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{match.group(5) or ''}")
+        out.extend(body)
+
+    return "\n".join(out) + "\n"
+
+
+def _hunk_body(lines: list[str], start: int) -> tuple[list[str], int]:
+    """Collect a hunk's body lines, stopping at the next hunk or file header."""
+    body: list[str] = []
+    index = start
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith(("@@", "diff --git ", "--- ", "+++ ")):
+            break
+        # An empty line is an unchanged line whose trailing space was stripped.
+        if line and line[0] not in " +-\\":
+            break
+        body.append(line)
+        index += 1
+    return body, index
 
 
 def _target_files(diff: str) -> list[str]:

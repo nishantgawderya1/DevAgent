@@ -117,3 +117,31 @@ const handler = (req) => process(req);
     assert types["handler"] == "function"
     assert "readFile" in chunks[0]["metadata"]["calls"]
     assert "process" in chunks[2]["metadata"]["calls"]
+
+def test_chunk_paths_are_relative_to_the_repo_root(tmp_path: Path) -> None:
+    """Absolute paths in metadata reach the writer prompt and break git apply.
+
+    The writer is shown file_path and asked for a unified diff; git apply only
+    accepts repo-relative paths, so an absolute checkout path produced patches
+    that could never be applied.
+    """
+    repo = tmp_path / "checkout"
+    (repo / "pkg").mkdir(parents=True)
+    file_path = repo / "pkg" / "mod.py"
+    file_path.write_text("def helper():\n    return 1\n", encoding="utf-8")
+
+    chunk = chunk_file(file_path, repo)[0]
+
+    assert chunk["metadata"]["file_path"] == "pkg/mod.py"
+    assert chunk["id"] == "pkg/mod.py::helper"
+    assert str(tmp_path) not in chunk["id"]
+
+
+def test_chunk_paths_fall_back_to_the_name_outside_the_root(tmp_path: Path) -> None:
+    outside = tmp_path / "elsewhere.py"
+    outside.write_text("def helper():\n    return 1\n", encoding="utf-8")
+
+    chunk = chunk_file(outside, tmp_path / "checkout")[0]
+
+    # Never leak a path from outside the repository into the prompt.
+    assert chunk["metadata"]["file_path"] == "elsewhere.py"

@@ -43,5 +43,5 @@ Both report `assert 51 == 50`.
 
 ### Notes
 
-Pages under the maximum are fine, so the clamping boundary looks like the place
-to check rather than the slicing itself.
+Pages requested below the maximum come back the right length, so the problem
+only shows at the upper bound.

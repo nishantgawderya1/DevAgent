@@ -58,7 +58,7 @@ def test_index_repo_walks_files_batches_embeddings_and_upserts(monkeypatch, tmp_
     fake_client = FakeQdrantClient(collection_exists=False, point_count=0)
     seen_files: list[Path] = []
 
-    def fake_chunk_file(file_path: str | Path):
+    def fake_chunk_file(file_path: str | Path, root: str | Path | None = None):
         path = Path(file_path)
         seen_files.append(path)
         return [
@@ -141,10 +141,13 @@ def test_index_repo_skips_when_collection_already_has_points(monkeypatch, tmp_pa
 
 
 def test_ensure_repo_checkout_clones_when_missing(tmp_path: Path, monkeypatch) -> None:
+    # Pin the token off so the clone URL is deterministic regardless of the
+    # developer's environment; the authenticated form is covered separately.
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     destination = tmp_path / "owner__flask"
     calls: list[tuple[list[str], bool]] = []
 
-    def fake_run(command, check):
+    def fake_run(command, check=True, **kwargs):
         calls.append((list(command), check))
         destination.mkdir(parents=True, exist_ok=True)
         return SimpleNamespace(returncode=0)
@@ -164,9 +167,10 @@ def test_checkout_dirs_do_not_collide_across_owners(tmp_path: Path, monkeypatch)
     Qdrant already namespaced these apart, so a shared directory meant retrieval
     read one repo's index while the patch was applied to the other's code.
     """
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     created: list[str] = []
 
-    def fake_run(command, check):
+    def fake_run(command, check=True, **kwargs):
         destination = Path(command[-1])
         destination.mkdir(parents=True, exist_ok=True)
         created.append(destination.name)
@@ -193,6 +197,9 @@ def test_existing_checkout_is_synced_not_returned_stale(tmp_path: Path, monkeypa
 
     def fake_run(command, **kwargs):
         git_calls.append(list(command)[1:])
+        if "--show-toplevel" in command:
+            # git agrees this directory is its own repository root
+            return SimpleNamespace(returncode=0, stdout=f"{repo_path.as_posix()}\n", stderr="")
         if "symbolic-ref" in command:
             return SimpleNamespace(returncode=0, stdout="refs/remotes/origin/main\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -207,6 +214,40 @@ def test_existing_checkout_is_synced_not_returned_stale(tmp_path: Path, monkeypa
     assert "fetch" in verbs
     assert "reset" in verbs
     assert "clone" not in verbs  # reuse the tree, but only after syncing it
+
+
+def test_partially_deleted_checkout_is_never_synced(tmp_path: Path, monkeypatch) -> None:
+    """A .git husk must not aim fetch/reset/clean at the *enclosing* repository.
+
+    On Windows a failed rmtree leaves .git behind because git marks its objects
+    read-only. The directory then looks like a checkout but is not a valid repo,
+    so git walks up to the nearest real one. With the index root living inside
+    another checkout, syncing would hard-reset and clean a tree that was never
+    meant to be touched. This reclones instead.
+    """
+    repo_path = tmp_path / "owner__flask"
+    (repo_path / ".git").mkdir(parents=True)  # husk: exists, but not a repository
+
+    enclosing = tmp_path.parent  # what git would walk up to
+    git_calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        git_calls.append(list(command)[1:])
+        if "--show-toplevel" in command:
+            # git reports the ENCLOSING repo, not our directory
+            return SimpleNamespace(returncode=0, stdout=f"{enclosing.as_posix()}\n", stderr="")
+        repo_path.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(indexer, "INDEX_ROOT", tmp_path)
+    monkeypatch.setattr(indexer.subprocess, "run", fake_run)
+
+    indexer._ensure_repo_checkout("owner/flask")
+
+    verbs = [call[0] for call in git_calls]
+    assert "clone" in verbs, "must reclone rather than trust the husk"
+    for destructive in ("fetch", "reset", "clean", "checkout"):
+        assert destructive not in verbs, f"{destructive} would have hit the enclosing repo"
 
 
 def test_reindex_is_skipped_only_when_the_sha_still_matches(tmp_path: Path, monkeypatch) -> None:

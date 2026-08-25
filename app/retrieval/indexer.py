@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from app.fsutil import remove_tree
 from app.retrieval import chunker
 
 
@@ -98,7 +99,7 @@ def index_repo(repo_full_name: str) -> IndexSummary:
         chunks: list[dict[str, Any]] = []
         for file_path in _iter_source_files(repo_path):
             files_indexed += 1
-            chunks.extend(_safe_chunk_file(file_path))
+            chunks.extend(_safe_chunk_file(file_path, repo_path))
 
         embeddings = _embed_chunks(chunks)
         _upsert_chunks(qdrant_client, collection_name, chunks, embeddings)
@@ -113,9 +114,9 @@ def index_repo(repo_full_name: str) -> IndexSummary:
         return IndexSummary(repo_full_name, collection_name, INDEX_ROOT, 0, 0)
 
 
-def _safe_chunk_file(file_path: Path) -> list[dict[str, Any]]:
+def _safe_chunk_file(file_path: Path, root: Path) -> list[dict[str, Any]]:
     try:
-        return chunker.chunk_file(file_path)
+        return chunker.chunk_file(file_path, root)
     except Exception:
         logger.warning("Skipping file that failed to chunk: %s", file_path, exc_info=True)
         return []
@@ -137,29 +138,74 @@ def _ensure_repo_checkout(repo_full_name: str) -> Path:
     would contain a revert of every upstream commit made since the clone.
     """
     repo_path = INDEX_ROOT / _collection_name(repo_full_name)
+    fetch_url = _fetch_url(repo_full_name)
 
-    if (repo_path / ".git").is_dir():
+    if _is_own_checkout(repo_path):
         try:
-            _sync_checkout(repo_path)
+            _sync_checkout(repo_path, fetch_url)
             return repo_path
         except subprocess.CalledProcessError:
             # A corrupt or half-cloned tree is not worth diagnosing; recloning is
             # cheap and always correct.
             logger.warning("Could not sync %s; recloning.", repo_path, exc_info=True)
-            shutil.rmtree(repo_path, ignore_errors=True)
+            remove_tree(repo_path)
 
     repo_path.parent.mkdir(parents=True, exist_ok=True)
     if repo_path.exists():
-        shutil.rmtree(repo_path)
-    subprocess.run(
-        ["git", "clone", f"https://github.com/{repo_full_name}.git", str(repo_path)], check=True
-    )
+        remove_tree(repo_path)
+    subprocess.run(["git", "clone", fetch_url, str(repo_path)], check=True)
+
+    # Drop the credential from the stored remote; fetches supply it explicitly.
+    if fetch_url != _public_url(repo_full_name):
+        _run_git(["remote", "set-url", "origin", _public_url(repo_full_name)], repo_path)
     return repo_path
 
 
-def _sync_checkout(repo_path: Path) -> None:
+def _public_url(repo_full_name: str) -> str:
+    return f"https://github.com/{repo_full_name}.git"
+
+
+def _fetch_url(repo_full_name: str) -> str:
+    """Clone/fetch URL, carrying a token when one is configured.
+
+    Public repositories work without it; private ones cannot be read at all
+    without credentials. The token is passed per-command rather than written
+    into .git/config, so it never persists on disk in the checkout.
+    """
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        return _public_url(repo_full_name)
+    return f"https://x-access-token:{token}@github.com/{repo_full_name}.git"
+
+
+def _is_own_checkout(repo_path: Path) -> bool:
+    """True only when ``repo_path`` is the root of its *own* git repository.
+
+    A directory holding a ``.git`` that is not a valid repository makes git walk
+    **up** to the nearest enclosing one. The index root commonly lives inside a
+    checkout of something else, so a half-deleted tree here would silently aim
+    every destructive command at the parent repository -- a fetch, a hard reset
+    and a ``git clean -qfd`` against a tree that was never meant to be touched.
+
+    Checking that ``.git`` merely exists is not enough; ask git where it thinks
+    it is and require that answer to be this directory.
+    """
+    if not (repo_path / ".git").exists():
+        return False
+    try:
+        toplevel = _run_git(["rev-parse", "--show-toplevel"], repo_path).strip()
+        return bool(toplevel) and Path(toplevel).resolve() == repo_path.resolve()
+    except (subprocess.CalledProcessError, OSError):
+        return False
+
+
+def _sync_checkout(repo_path: Path, fetch_url: str) -> None:
     """Fetch and hard-reset an existing checkout onto the remote default branch."""
-    _run_git(["fetch", "--quiet", "origin"], repo_path)
+    # Re-checked immediately before the destructive commands: everything below
+    # rewrites the working tree, and aiming it at the wrong repo destroys data.
+    if not _is_own_checkout(repo_path):
+        raise subprocess.CalledProcessError(1, ["git", "rev-parse", "--show-toplevel"])
+    _run_git(["fetch", "--quiet", fetch_url, "+refs/heads/*:refs/remotes/origin/*"], repo_path)
     branch = _default_branch(repo_path)
     _run_git(["checkout", "--quiet", "--force", "-B", branch, f"origin/{branch}"], repo_path)
     _run_git(["reset", "--quiet", "--hard", f"origin/{branch}"], repo_path)

@@ -86,13 +86,35 @@ def _load_corpus(client: Any, collection_name: str) -> list[dict[str, Any]]:
 def _semantic_search(client: Any, collection_name: str, query: str) -> list[str]:
     model = indexer._load_embedding_model()
     vector = _embed_query(model, query)
-    hits = client.search(
+    hits = _vector_search(client, collection_name, vector)
+    return [hit.payload["id"] for hit in hits if hit.payload]
+
+
+def _vector_search(client: Any, collection_name: str, vector: list[float]) -> Any:
+    """Run the vector query across qdrant-client API generations.
+
+    ``search()`` was superseded by ``query_points()``, which returns a response
+    object wrapping the hits rather than the hits themselves. requirements.txt
+    allows ``qdrant-client>=1.7``, which spans both, and the installed 1.18 has
+    dropped ``search()`` entirely -- caught only against a live Qdrant, because
+    the test fake defined the method the real client no longer has.
+    """
+    query_points = getattr(client, "query_points", None)
+    if callable(query_points):
+        response = query_points(
+            collection_name=collection_name,
+            query=vector,
+            limit=SEMANTIC_TOP_N,
+            with_payload=True,
+        )
+        return getattr(response, "points", response)
+
+    return client.search(
         collection_name=collection_name,
         query_vector=vector,
         limit=SEMANTIC_TOP_N,
         with_payload=True,
     )
-    return [hit.payload["id"] for hit in hits if hit.payload]
 
 
 def _embed_query(model: Any, query: str) -> list[float]:

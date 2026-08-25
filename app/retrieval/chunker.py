@@ -40,17 +40,36 @@ _IMPORT_TYPES = {
 _CALL_TYPES = {".py": "call", ".js": "call_expression"}
 
 
-def chunk_file(file_path: str | Path) -> list[CodeChunk]:
+def chunk_file(file_path: str | Path, root: str | Path | None = None) -> list[CodeChunk]:
+    """Chunk one source file.
+
+    ``root`` is the repository root. Paths in chunk metadata are recorded
+    relative to it, because those paths reach the writer's prompt and end up in
+    a unified diff -- and ``git apply`` only accepts repo-relative paths.
+    Recording the absolute checkout path produced diffs that could never apply.
+    """
     path = Path(file_path)
     source = path.read_text(encoding="utf-8")
     suffix = path.suffix
+    display = _display_path(path, root)
 
     if suffix in _LANGUAGES:
-        chunks = _chunk_with_tree_sitter(path, source, suffix)
+        chunks = _chunk_with_tree_sitter(display, source, suffix)
         if chunks:
             return chunks
 
-    return [_build_file_chunk(path, source)]
+    return [_build_file_chunk(display, source)]
+
+
+def _display_path(path: Path, root: str | Path | None) -> Path:
+    """Path as the model should see it: relative to the repository root."""
+    if root is None:
+        return path
+    try:
+        return path.resolve().relative_to(Path(root).resolve())
+    except ValueError:
+        # Outside the root: fall back to the bare name so no full path leaks.
+        return Path(path.name)
 
 
 def _chunk_with_tree_sitter(path: Path, source: str, suffix: str) -> list[CodeChunk]:

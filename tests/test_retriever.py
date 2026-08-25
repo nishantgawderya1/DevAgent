@@ -104,3 +104,62 @@ def test_tokenize_splits_identifiers() -> None:
     assert "index" in tokens
     assert "repo" in tokens
     assert "index_repo" in tokens
+
+
+class ModernFakeQdrantClient:
+    """Exposes query_points() only, like qdrant-client >= 1.10.
+
+    The original fake defined search(), which every test used -- so the removal
+    of search() from the real client sailed through the suite and only surfaced
+    against a live Qdrant. This fake pins the modern path.
+    """
+
+    def __init__(self, corpus: list[dict[str, Any]], semantic_order: list[str]) -> None:
+        self._corpus = corpus
+        self._semantic_order = semantic_order
+        self.query_calls: list[dict[str, Any]] = []
+
+    def scroll(self, collection_name, limit, offset=None, with_payload=True, with_vectors=False):
+        if offset is not None:
+            return [], None
+        return [SimpleNamespace(payload=payload) for payload in self._corpus], None
+
+    def query_points(self, collection_name, query, limit, with_payload=True):
+        self.query_calls.append({"collection_name": collection_name, "limit": limit})
+        by_id = {payload["id"]: payload for payload in self._corpus}
+        points = [SimpleNamespace(payload=by_id[cid]) for cid in self._semantic_order[:limit]]
+        # The real client wraps hits in a response object rather than returning them.
+        return SimpleNamespace(points=points)
+
+
+def test_retrieve_works_against_the_query_points_api(monkeypatch) -> None:
+    # Same corpus as the search()-based fusion test, so this isolates the API
+    # difference rather than re-testing ranking behaviour.
+    corpus = [
+        _chunk("login", "def login(user): handle the user login flow", calls=[]),
+        _chunk("authenticate", "def authenticate(token): validate the token", calls=[]),
+        _chunk("logout", "def logout(): end the session", calls=[]),
+    ]
+    client = ModernFakeQdrantClient(corpus, semantic_order=["mod.py::authenticate", "mod.py::login"])
+    monkeypatch.setattr(indexer, "_load_embedding_model", lambda: FakeEmbeddingModel())
+
+    results = retriever.retrieve("login", "owner/repo", top_k=5, qdrant_client=client)
+
+    assert [r.chunk_id for r in results][0] == "mod.py::login"
+    assert client.query_calls and client.query_calls[0]["limit"] == retriever.SEMANTIC_TOP_N
+
+
+def test_dependency_expansion_works_on_the_modern_api(monkeypatch) -> None:
+    corpus = [
+        _chunk("paginate", "def paginate(items, page_size): ...", calls=["clamp_page_size"]),
+        _chunk("clamp_page_size", "def clamp_page_size(requested, maximum): ...", calls=[]),
+    ]
+    client = ModernFakeQdrantClient(corpus, semantic_order=["mod.py::paginate"])
+    monkeypatch.setattr(indexer, "_load_embedding_model", lambda: FakeEmbeddingModel())
+
+    results = retriever.retrieve("page size", "owner/repo", top_k=1, qdrant_client=client)
+
+    assert [(r.chunk_id, r.source) for r in results] == [
+        ("mod.py::paginate", "fused"),
+        ("mod.py::clamp_page_size", "expanded"),
+    ]
